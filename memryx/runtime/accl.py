@@ -20,8 +20,8 @@ import numpy as np
 try:
     import memryx
 except ImportError:
-    memryx_home = Path(__file__).parent.parent.resolve()
-    sys.path.append(str(memryx_home))
+    mix_home = Path(__file__).parent.parent.resolve()
+    sys.path.append(str(mix_home))
     import memryx
 
 from memryx.errors import MxaError
@@ -88,26 +88,26 @@ class SchedulerOptions:
     Parameters
     ----------
     frame_limit : int, optional
-        Number of frames to process before swapping out. Default is 600.
+        Number of frames to process before swapping out. Default is 20.
 
     time_limit : int, optional
-        Maximum time (in milliseconds) before swapping out. Default is 0.
+        Maximum idle time (in milliseconds) before swapping out. Default is 250.
 
     stop_on_empty : bool, optional
-        Whether to swap out if the input queue is empty. Default is False.
+        **REMOVED IN SDK 2.1** Always is False.
 
     ifmap_queue_size : int, optional
         Size of the shared input feature map queue. Default is 16.
 
     ofmap_queue_size : int, optional
-        Size of the per-client output feature map queues. Default is 12.
+        Size of the per-client output feature map queues. Default is 21.
 
     """
-    frame_limit: int = 600
-    time_limit: int = 0
+    frame_limit: int = 20
+    time_limit: int = 250
     stop_on_empty: bool = False
     ifmap_queue_size: int = 16
-    ofmap_queue_size: int = 12
+    ofmap_queue_size: int = 21
 
 
 @dataclass
@@ -146,14 +146,14 @@ class Accl(ABC):
 
         ##### Import python bindings for mxa and mxapi #####
         try:
-            from memryx import mxa
+            self.mxa = memryx.mxa  # type:ignore
         except AttributeError:
             raise MxaError(
                 message="driver package not installed! Please install the .deb/.rpm/.tgz and try again"
             )
 
         try:
-            from memryx import mxapi
+            self.mxapi = memryx.mxapi # type:ignore
         except AttributeError:
             raise MxaError(
                 message="runtime package not installed! Please install the .deb/.rpm/.tgz using `sudo apt install memx-accl` and try again"
@@ -226,6 +226,54 @@ class Accl(ABC):
 
         self._configure()
 
+    def get_pressure(self, device_id: int) -> str:
+        """
+        Get the current pressure status of the specified device.
+
+        Parameters
+        ----------
+        device_id : int
+            The ID of the device for which to retrieve the pressure status. Ignored for local_mode=True, which is one device only.
+
+        Returns
+        -------
+        str
+            The current pressure status of the device. Possible values are "low", "medium", "high" and "full".
+        """
+        return self._dfp_runner.get_pressure(device_id)
+    
+    def get_temperature(self, device_id: int) -> float:
+        """
+        Get the current max temperature of the specified device.
+
+        Parameters
+        ----------
+        device_id : int
+            The ID of the device for which to retrieve the temp. Ignored for local_mode=True, which is one device only.
+
+        Returns
+        -------
+        float
+            The temperature of the device in Celsius.
+        """
+        return self._dfp_runner.get_temperature(device_id)
+    
+    def get_avg_power(self, device_id: int) -> float:
+        """
+        Get the average power of the specified device (if supported).
+        NOTE: this is only supported for Shared Mode (local_mode=False) in this SDK release!
+
+        Parameters
+        ----------
+        device_id : int
+            The ID of the device for which to retrieve the power.
+
+        Returns
+        -------
+        float
+            The average power consumption of the device in milliwatts (mW).
+        """
+        return self._dfp_runner.get_avg_power(device_id)
 
     def _configure(self, inport_mapping={}, outport_mapping={}):
         for idx_pair, mapping in inport_mapping.items():
@@ -601,7 +649,8 @@ class AcclModelInput(ABC):
                 shape = shape[:-2] + [shape[-1]]
             if self._use_model_shape_in is True:
                 fmap = convert_to_mxainput(self._input_shape_info[port], fmap)
-            if list(fmap.shape) not in [list(shape), [1] + list(shape)]:
+            compressed_shape = [i for i in shape if i != 1]
+            if list(np.squeeze(fmap).shape) not in [compressed_shape, list(compressed_shape)]:
                 raise RuntimeError(
                     f"Model {model_idx} input port {port} expects data of shape {shape}, but got {fmap.shape}"
                 )
@@ -705,7 +754,7 @@ class AcclModelOutput(ABC):
         for idx, port in enumerate(self._info["ports"]):
             shape = self._info["shapes"][idx]
             dtype = self._info["dtypes"][idx]
-            ofmap = np.zeros(shape).astype(dtype)
+            ofmap = np.zeros(shape, dtype=dtype)
 
             logger.debug(f"Model {model_idx} recv ofmap from port {port} with shape {ofmap.shape}")
 
@@ -763,15 +812,15 @@ class SyncAccl(Accl):
         Scheduler configuration corresponding to the SchedulerOptions struct:
         
         - frame_limit : int  
-          Number of frames to process before swapping out. Default 600.
+          Number of frames to process before swapping out. Default 20.
         - time_limit : int  
-          Maximum time (in milliseconds) before swapping out. Default 0.
+          Maximum idle time (in milliseconds) before swapping out. Default 250.
         - stop_on_empty : bool  
-          Whether to swap out if the input queue is empty. Default False.
+          Whether to immediately swap if the input queue is empty. Default False.
         - ifmap_queue_size : int  
           Size of the shared input feature map queue. Default 16.
         - ofmap_queue_size : int  
-          Size of the per-client output feature map queues. Default 12.
+          Size of the per-client output feature map queues. Default 21.
 
     client_options : ClientOptions, optional
         Client runtime behavior configuration, corresponding to the ClientOptions struct:
@@ -1323,7 +1372,7 @@ class SyncAcclModelOutput(AcclModelOutput):
         relative_port_idx = port_idx - min(self._info["ports"])
 
         shape = self._info["shapes"][relative_port_idx]
-        ofmap = np.zeros(shape).astype(np.float32)
+        ofmap = np.zeros(shape, dtype=np.float32)
         
         # stream output feature map
         success = self._accl._dfp_runner.stream_ofmap(model_idx, port_idx, ofmap)
@@ -1377,15 +1426,15 @@ class AsyncAccl(Accl):
         Scheduler configuration corresponding to the SchedulerOptions struct:
         
         - frame_limit : int  
-          Number of frames to process before swapping out. Default 600.
+          Number of frames to process before swapping out. Default 20.
         - time_limit : int  
-          Maximum time (in milliseconds) before swapping out. Default 0.
+          Maximum idle time (in milliseconds) before swapping out. Default 250.
         - stop_on_empty : bool  
-          Whether to swap out if the input queue is empty. Default False.
+          Whether to immediately swap if the input queue is empty. Default False.
         - ifmap_queue_size : int  
           Size of the shared input feature map queue. Default 16.
         - ofmap_queue_size : int  
-          Size of the per-client output feature map queues. Default 12.
+          Size of the per-client output feature map queues. Default 21.
 
     client_options : ClientOptions, optional
         Client runtime behavior configuration, corresponding to the ClientOptions struct:
@@ -1970,15 +2019,15 @@ class MultiStreamAsyncAccl(Accl):
         Scheduler configuration corresponding to the SchedulerOptions struct:
         
         - frame_limit : int  
-          Number of frames to process before swapping out. Default 600.
+          Number of frames to process before swapping out. Default 20.
         - time_limit : int  
-          Maximum time (in milliseconds) before swapping out. Default 0.
+          Maximum idle time (in milliseconds) before swapping out. Default 250.
         - stop_on_empty : bool  
-          Whether to swap out if the input queue is empty. Default False.
+          Whether to immediately swap if the input queue is empty. Default False.
         - ifmap_queue_size : int  
           Size of the shared input feature map queue. Default 16.
         - ofmap_queue_size : int  
-          Size of the per-client output feature map queues. Default 12.
+          Size of the per-client output feature map queues. Default 21.
 
     client_options : ClientOptions, optional
         Client runtime behavior configuration, corresponding to the ClientOptions struct:
@@ -2132,9 +2181,9 @@ class MultiStreamAsyncAccl(Accl):
             A function or bound method invoked with the output feature maps generated by the model.
             It must accept at least two arguments:
 
-            - stream_idx : int  
+            - stream_idx : int 
               The index of the output stream (same as input).
-            - \*ofmaps : tuple or unpacked  
+            - \*ofmaps : tuple or unpacked 
               The output feature maps. The function can use a variadic signature (\*ofmaps) or 
               named parameters (e.g., fmap0, fmap1, ...) depending on how many feature maps 
               the model produces.

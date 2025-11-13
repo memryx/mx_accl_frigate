@@ -2,6 +2,7 @@ import sys
 from collections import defaultdict, deque
 from pathlib import Path
 import logging
+from threading import Thread
 import numpy as np
 
 try:
@@ -42,12 +43,23 @@ class DFPRunner:
         self.in_cnt = 0 # for debug
         self.out_cnt = 0 # for debug
 
+        self._run_pressure_thread = False
+        self._pressure_thread = None
+        self._current_pressure = "N/A"
+
     def _clear_local(self):
 
         if not self._ignore_manager:
             # runner is already cleared
             if len(self._clients) == 0:
                 return
+
+        if self._pressure_thread is not None:
+            self._run_pressure_thread = False
+            if self._pressure_thread.is_alive():
+                self._pressure_thread.join()
+            self._pressure_thread = None
+            self._current_pressure = "N/A"
             
         # memx_close any open contexts
         for context_id in self._local_open_contexts:
@@ -64,6 +76,40 @@ class DFPRunner:
             self._clients.clear()
 
         self._local_open_contexts.clear()
+
+    def _pressure_monitor_thread(self, device_id: int):
+        import time
+
+        logger.debug(f" Starting pressure monitor thread for device id: {device_id}")
+
+        if self._local_mode:
+            HISTORY_LEN = 4
+            pressure_history = deque(maxlen=HISTORY_LEN)
+
+            while self._run_pressure_thread:
+                fpressure = np.float32(int(memryx.mxa.get_utilization(device_id, 0)))
+                if len(pressure_history) == HISTORY_LEN:
+                    # remove front
+                    pressure_history.popleft()
+                pressure_history.append(fpressure)
+                avg_pressure = np.float32(sum(pressure_history)) / np.float32(len(pressure_history))
+
+                if avg_pressure < memryx.mxapi.MEMX_PRESSURE_LOW_THRESH:
+                    self._current_pressure = "low"
+                elif avg_pressure < memryx.mxapi.MEMX_PRESSURE_MEDIUM_THRESH:
+                    self._current_pressure = "medium"
+                elif avg_pressure < memryx.mxapi.MEMX_PRESSURE_HIGH_THRESH:
+                    self._current_pressure = "high"
+                else:
+                    self._current_pressure = "full"
+
+                time.sleep(1.0)
+        else:
+            # error, don't start a separate thread for shared mode, just use client
+            # to get it from server
+            logger.error(f" Pressure monitor thread should not be started in shared mode for device id: {device_id}")
+
+        logger.debug(f" Exiting pressure monitor thread for device id: {device_id}")
 
     def init_local(self) -> bool:
 
@@ -138,7 +184,6 @@ class DFPRunner:
 
 
         ############### set_power_mode for each opened device ###############
-
         dfp_mpus = self._dfp_obj.num_chips
         hw_mpus = memryx.mxa.get_total_chip_count(device_id)
 
@@ -175,6 +220,11 @@ class DFPRunner:
                 f"Input DFP was compiled for {dfp_mpus} chips, but the connected accelerator has {hw_mpus} chips")
             self._clear_local()
             return False
+
+        ############### start the pressure monitoring thread ###############
+        self._run_pressure_thread = True
+        self._pressure_thread = Thread(target=self._pressure_monitor_thread, args=(device_id,))
+        self._pressure_thread.start()
 
         ############### Download the DFP to each open device ###############
         if memryx.mxa.download_buffer(driver_context_id, self._dfp_obj._dfp_bytes.getvalue()):
@@ -335,10 +385,23 @@ class DFPRunner:
                 client_options,
                 self._device_ids_to_use,
             )
-
+            
             if not success:
                 logger.error(f" Client connect dfp failed")
                 return False
+
+            # set the frequency as specified
+            # probably involves setting the power mulitple
+            # times, but that's ok
+            dfp_mpus = self._dfp_obj.num_chips
+            if dfp_mpus == 2:
+                powercfg = get_power_tuple()
+                for dev_id in self._device_ids_to_use:
+                    client.set_power_mode(dev_id, powercfg[2])
+            else:
+                powercfg = get_power_tuple()
+                for dev_id in self._device_ids_to_use:
+                    client.set_power_mode(dev_id, powercfg[0])
 
             self._clients.append(client)
 
@@ -493,3 +556,88 @@ class DFPRunner:
             for client in self._clients:
                 client.end_connection()
             self._clients.clear()
+
+
+    def get_pressure(self, device_id) -> str:
+        """
+        Get the current pressure level of the device.
+        """
+        
+        if self._local_mode:
+            # ignores device ID since only 1 device allowed
+            # in local mode
+            return self._current_pressure
+        else:
+            # in shared mode, get pressure from the client
+            # corresponding to the device_id
+            # note: the order of the clients list matches the
+            #       order of the devices in device_ids_to_use
+            
+            if device_id in self._device_ids_to_use:
+                idx = self._device_ids_to_use.index(device_id)
+                client = self._clients[idx]
+                pressure = client.get_pressure(device_id)
+                return pressure
+            else:
+                logger.error(
+                    f" get_pressure: Device ID {device_id} not found in device_ids_to_use")
+                return "N/A"
+
+
+    def get_temperature(self, device_id) -> float:
+        """
+        Get the current temperature of the device.
+        """
+        
+        if self._local_mode:
+            # ignores device ID since only 1 device allowed
+            # in local mode
+            dfp_mpus = self._dfp_obj.num_chips
+            temps = []
+            for i in range(dfp_mpus):
+                tempi = memryx.mxa.get_temperature(device_id, i)
+                temps.append(tempi)
+            max_temp = max(temps)
+            return float(max_temp)
+        else:
+            # in shared mode, get temperature from the client
+            # corresponding to the device_id
+            # note: the order of the clients list matches the
+            #       order of the devices in device_ids_to_use
+            
+            if device_id in self._device_ids_to_use:
+                idx = self._device_ids_to_use.index(device_id)
+                client = self._clients[idx]
+                temperature = client.get_inst_max_temp(device_id)
+                return temperature
+            else:
+                logger.error(
+                    f" get_temperature: Device ID {device_id} not found in device_ids_to_use")
+                return -1.0
+    
+    def get_avg_power(self, device_id) -> float:
+        """
+        Get the average power consumption of the device.
+        Shared mode ONLY.
+        """
+        
+        if self._local_mode:
+            # not suppported
+            logger.error(
+                f" get_avg_power: Not supported in local mode")
+            return -3000.0
+        else:
+            # in shared mode, get temperature from the client
+            # corresponding to the device_id
+            # note: the order of the clients list matches the
+            #       order of the devices in device_ids_to_use
+            
+            if device_id in self._device_ids_to_use:
+                idx = self._device_ids_to_use.index(device_id)
+                client = self._clients[idx]
+                power = client.get_avg_power(device_id)
+                return power
+            else:
+                logger.error(
+                    f" get_avg_power: Device ID {device_id} not found in device_ids_to_use")
+                return -1.0
