@@ -146,14 +146,14 @@ class Accl(ABC):
 
         ##### Import python bindings for mxa and mxapi #####
         try:
-            self.mxa = memryx.mxa  # type:ignore
+            from memryx import mxa  # type:ignore
         except AttributeError:
             raise MxaError(
                 message="driver package not installed! Please install the .deb/.rpm/.tgz and try again"
             )
 
         try:
-            self.mxapi = memryx.mxapi # type:ignore
+            from memryx import mxapi # type:ignore
         except AttributeError:
             raise MxaError(
                 message="runtime package not installed! Please install the .deb/.rpm/.tgz using `sudo apt install memx-accl` and try again"
